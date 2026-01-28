@@ -63,7 +63,12 @@ def make_spotify_client() -> spotipy.Spotify:
         client_id=client_id,
         client_secret=client_secret,
     )
-    return spotipy.Spotify(auth_manager=auth_manager)
+    return spotipy.Spotify(
+        auth_manager=auth_manager,
+        retries=0,  # we handle retries ourselves
+        status_retries=0,
+        backoff_factor=0,
+    )
 
 
 def spotify_call(fn, *args, max_retries: int = 5, **kwargs):
@@ -81,9 +86,28 @@ def spotify_call(fn, *args, max_retries: int = 5, **kwargs):
             return fn(*args, **kwargs)
         except SpotifyException as e:
             if e.http_status == 429:
-                # Spotipy doesn't always expose Retry-After cleanly, so we do exponential backoff.
-                print(f"[rate-limit] 429 from Spotify. Sleeping {delay_seconds:.1f}s (attempt {attempt}/{max_retries})")
-                time.sleep(delay_seconds)
+                retry_after = None
+                if hasattr(e, "headers") and e.headers:
+                    retry_after = e.headers.get("Retry-After")
+
+                if retry_after is not None:
+                    try:
+                        retry_after = float(retry_after)
+                    except ValueError:
+                        retry_after = None
+
+                # If Spotify says something insane (hours), don't hang the script.
+                if retry_after and retry_after > 120:
+                    raise RuntimeError(
+                        f"Spotify rate limit hit with Retry-After={retry_after:.0f}s (very large). "
+                        "Stop the run and try again later, or reduce caps."
+                    )
+
+                sleep_for = retry_after if retry_after is not None else delay_seconds
+                sleep_for = min(sleep_for, 60)
+
+                print(f"[rate-limit] 429 from Spotify. Sleeping {sleep_for:.1f}s (attempt {attempt}/{max_retries})")
+                time.sleep(sleep_for)
                 delay_seconds = min(delay_seconds * 2, 30)
                 continue
 
@@ -442,8 +466,8 @@ def main():
         max_hop1=200,
         max_seed_albums=200,
         max_seed_tracks=3000,
-        max_albums_per_hop1_artist=50,
-        max_tracks_per_hop1_artist=1500,
+        max_albums_per_hop1_artist=25,
+        max_tracks_per_hop1_artist=1000,
     )
 
     seed_name = nodes_df[nodes_df["hop"] == 0].iloc[0]["name"]
