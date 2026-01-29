@@ -91,8 +91,8 @@ def edge_style(weight: float) -> Dict[str, float]:
 
 
 def load_graph_data(out_dir: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    nodes_path = os.path.join(out_dir, "nodes.csv")
-    edges_path = os.path.join(out_dir, "edges.csv")
+    nodes_path = os.path.join(out_dir, "data", "nodes.csv")
+    edges_path = os.path.join(out_dir, "data", "edges.csv")
 
     if not os.path.exists(nodes_path) or not os.path.exists(edges_path):
         raise FileNotFoundError(
