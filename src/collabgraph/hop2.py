@@ -169,11 +169,15 @@ def get_artists_details_bulk(sp: spotipy.Spotify, artist_ids: List[str]) -> List
 # Collecting track IDs for an artist (album-based approach)
 # ----------------------------
 
-def get_artist_albums(sp: spotipy.Spotify, artist_id: str, max_albums: int) -> List[dict]:
+def get_artist_albums(sp: spotipy.Spotify, artist_id: str, max_albums: int, include_appears_on: bool) -> List[dict]:
+    include_groups = "album,single,compilation"
+    if include_appears_on:
+        include_groups += ",appears_on"
+    
     first_page = spotify_call(
         sp.artist_albums,
         artist_id,
-        album_type="album,single,compilation",
+        include_groups=include_groups,
         country="US",
         limit=50,
     )
@@ -200,12 +204,18 @@ def get_artist_track_ids(
     artist_id: str,
     max_albums: int,
     max_tracks: int,
+    include_appears_on: bool,
 ) -> List[str]:
     """
     Returns a deduped list of track IDs for an artist via albums -> tracks.
     Controlled by caps to limit API usage.
     """
-    albums = get_artist_albums(sp, artist_id, max_albums=max_albums)
+    albums = get_artist_albums(
+        sp,
+        artist_id,
+        max_albums=max_albums,
+        include_appears_on=include_appears_on,
+    )
 
     track_ids: List[str] = []
     for album in albums:
@@ -240,6 +250,7 @@ def build_hop1_from_seed_tracks(
         artist_id=seed_artist_id,
         max_albums=max_seed_albums,
         max_tracks=max_seed_tracks,
+        include_appears_on=True,
     )
 
     seed_tracks = get_tracks_details_bulk(sp, seed_track_ids)
@@ -384,6 +395,7 @@ def build_hop2_network(
             artist_id=hop1_id,
             max_albums=max_albums_per_hop1_artist,
             max_tracks=max_tracks_per_hop1_artist,
+            include_appears_on=False,
         )
 
         hop1_tracks = get_tracks_details_bulk(sp, hop1_track_ids)
