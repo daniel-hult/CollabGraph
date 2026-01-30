@@ -125,6 +125,14 @@ def spotify_call(fn, *args, max_retries: int = 5, **kwargs):
 # Helpers: paging + bulk endpoints
 # ----------------------------
 
+def status(message: str) -> None:
+    print(f"⏳ {message}")
+
+
+def done(message: str) -> None:
+    print(f"✅ {message}")
+
+
 def iter_paged(sp: spotipy.Spotify, first_page: dict) -> Iterable[dict]:
     """
     Generator over Spotify paged results.
@@ -309,6 +317,9 @@ def build_hop2_network(
     Builds a 2-hop network while keeping nodes limited to {seed + hop1}.
     """
     seed = spotify_call(sp.artist, seed_artist_id)
+    
+    done(f"Loaded seed artist: {seed.get('name')} ({seed_artist_id})")
+    status("Building Hop 1 (seed collaborations)…")
 
     # Hop 1 mapping and seed tracks
     collaborator_to_tracks, seed_tracks = build_hop1_from_seed_tracks(
@@ -318,6 +329,8 @@ def build_hop2_network(
         max_seed_tracks=max_seed_tracks,
     )
 
+    done(f"Hop 1 built: {len(collaborator_to_tracks)} collaborators found from {len(seed_tracks)} seed tracks")
+
     # Choose hop1 artists: top by hop1 weight, capped at max_hop1
     hop1_sorted = sorted(
         collaborator_to_tracks.items(),
@@ -326,10 +339,16 @@ def build_hop2_network(
     )
     hop1_ids = [artist_id for artist_id, _tracks in hop1_sorted[:max_hop1]]
 
+    done(f"Selected {len(hop1_ids)} Hop 1 artists (cap={max_hop1})")
+
     allowed_ids: Set[str] = set([seed_artist_id] + hop1_ids)
 
+    status("Fetching Hop 1 artist metadata (name/popularity/followers)…")
+    
     # Fetch metadata for nodes (seed + hop1)
     hop1_artist_objs = get_artists_details_bulk(sp, hop1_ids) if hop1_ids else []
+
+    done(f"Fetched metadata for {len(hop1_artist_objs)} Hop 1 artists")
 
     nodes: List[ArtistInfo] = [
         ArtistInfo(
@@ -379,6 +398,8 @@ def build_hop2_network(
             }
         )
 
+    status("Building edges from seed tracks…")
+
     # 1) Add edges from seed tracks (covers seed-hop1 cleanly)
     for tr in seed_tracks:
         artists = tr.get("artists", [])
@@ -388,8 +409,15 @@ def build_hop2_network(
             if other_id != seed_artist_id:
                 add_edge_track(seed_artist_id, other_id, tr)
 
+    done("Seed-track edges added")
+    status("Scanning Hop 1 artists for Hop 2 edges (within seed+hop1)…")
+
     # 2) Hop 2: scan tracks for each hop1 artist, add edges among allowed ids on those tracks
-    for hop1_id in hop1_ids:
+    total_hop1 = len(hop1_ids)
+    for idx, hop1_id in enumerate(hop1_ids, start=1):
+        if idx == 1 or idx % 10 == 0 or idx == total_hop1:
+            print(f"⏳ Hop 2 scan: {idx}/{total_hop1} hop1 artists…")
+
         hop1_track_ids = get_artist_track_ids(
             sp,
             artist_id=hop1_id,
@@ -437,6 +465,8 @@ def build_hop2_network(
         ["source_artist_id", "target_artist_id", "release_date", "track_name"],
         ascending=[True, True, False, True],
     )
+
+    done(f"Hop 2 complete: nodes={len(nodes_df)}, edges={len(edges_df)}, edge_tracks={len(edge_tracks_df)}")
 
     return nodes_df, edges_df, edge_tracks_df
 
