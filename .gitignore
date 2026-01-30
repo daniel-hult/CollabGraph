@@ -17,3 +17,6 @@ data/
 
 # Editor config (optional)
 .vscode/
+
+# Spotify Access Token cache
+.cache
