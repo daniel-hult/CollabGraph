@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import time
+import random
 import re
 from collections import defaultdict
 from dataclasses import dataclass
@@ -29,6 +30,23 @@ import spotipy
 from spotipy.oauth2 import SpotifyClientCredentials
 from spotipy.exceptions import SpotifyException
 
+
+# --- Throttle tuning (safe defaults) ---
+THROTTLE_ENABLED = True
+
+# Base delay applied to most Spotify calls (seconds)
+THROTTLE_BASE_SECONDS = 0.08  # 80ms
+
+# Random jitter added/subtracted to avoid "robotic bursts"
+THROTTLE_JITTER_SECONDS = 0.04  # +/- 40ms
+
+# Extra cooldown applied after we encounter a 429 (added to base temporarily)
+THROTTLE_429_COOLDOWN_SECONDS = 0.30  # 300ms
+
+# --- Simple run stats (helpful for you to understand runtime) ---
+SPOTIFY_CALL_COUNT = 0
+SPOTIFY_SLEEP_SECONDS = 0.0
+SPOTIFY_429_COUNT = 0
 
 # ----------------------------
 # Data shapes
@@ -73,19 +91,27 @@ def make_spotify_client() -> spotipy.Spotify:
 
 def spotify_call(fn, *args, max_retries: int = 5, **kwargs):
     """
-    Minimal retry/backoff wrapper to handle rate limits (429) and transient errors.
-    Keeps the logic readable and prevents the project from blowing up on Hop 2.
-
-    - If 429: sleep and retry
-    - Otherwise: re-raise
+    Retry/backoff wrapper for Spotify API calls.
+    Also applies a small throttle to reduce burstiness and tracks call stats.
     """
+
+    global SPOTIFY_CALL_COUNT
+    global SPOTIFY_429_COUNT
+
     delay_seconds = 1.0
 
     for attempt in range(1, max_retries + 1):
+        # Count and throttle PER ACTUAL REQUEST ATTEMPT (important!)
+        SPOTIFY_CALL_COUNT += 1
+        throttle_sleep()
+
         try:
             return fn(*args, **kwargs)
+
         except SpotifyException as e:
             if e.http_status == 429:
+                SPOTIFY_429_COUNT += 1
+
                 retry_after = None
                 if hasattr(e, "headers") and e.headers:
                     retry_after = e.headers.get("Retry-After")
@@ -107,14 +133,18 @@ def spotify_call(fn, *args, max_retries: int = 5, **kwargs):
                 sleep_for = min(sleep_for, 60)
 
                 print(f"[rate-limit] 429 from Spotify. Sleeping {sleep_for:.1f}s (attempt {attempt}/{max_retries})")
-                time.sleep(sleep_for)
+                sleep_and_track(sleep_for)
+
                 delay_seconds = min(delay_seconds * 2, 30)
+
+                # Small additional cooldown after 429 to avoid immediate re-triggering
+                throttle_sleep(extra=THROTTLE_429_COOLDOWN_SECONDS)
                 continue
 
             # Optional: retry some 5xx errors (rare but happens)
             if e.http_status and 500 <= e.http_status < 600 and attempt < max_retries:
                 print(f"[spotify] {e.http_status} server error. Sleeping {delay_seconds:.1f}s (attempt {attempt}/{max_retries})")
-                time.sleep(delay_seconds)
+                sleep_and_track(delay_seconds)
                 delay_seconds = min(delay_seconds * 2, 30)
                 continue
 
@@ -131,6 +161,32 @@ def status(message: str) -> None:
 
 def done(message: str) -> None:
     print(f"✅ {message}")
+
+
+def throttle_sleep(extra: float = 0.0) -> None:
+    """
+    Sleep a small amount to reduce burst rate and avoid triggering 429s.
+    """
+    global SPOTIFY_SLEEP_SECONDS
+
+    if not THROTTLE_ENABLED:
+        return
+
+    jitter = random.uniform(-THROTTLE_JITTER_SECONDS, THROTTLE_JITTER_SECONDS)
+    delay = max(0.0, THROTTLE_BASE_SECONDS + jitter + extra)
+
+    time.sleep(delay)
+    SPOTIFY_SLEEP_SECONDS += delay
+
+
+def sleep_and_track(seconds: float) -> None:
+    """
+    Sleep and include the time in SPOTIFY_SLEEP_SECONDS stats so your totals
+    reflect BOTH throttling and retry/backoff sleeps.
+    """
+    global SPOTIFY_SLEEP_SECONDS
+    time.sleep(seconds)
+    SPOTIFY_SLEEP_SECONDS += seconds
 
 
 def iter_paged(sp: spotipy.Spotify, first_page: dict) -> Iterable[dict]:
@@ -467,6 +523,10 @@ def build_hop2_network(
     )
 
     done(f"Hop 2 complete: nodes={len(nodes_df)}, edges={len(edges_df)}, edge_tracks={len(edge_tracks_df)}")
+    print(
+        f"\n📊 Spotify call stats: calls={SPOTIFY_CALL_COUNT}, "
+        f"throttle_sleep={SPOTIFY_SLEEP_SECONDS:.1f}s, 429s={SPOTIFY_429_COUNT}"
+    )
 
     return nodes_df, edges_df, edge_tracks_df
 

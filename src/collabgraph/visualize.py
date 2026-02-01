@@ -15,12 +15,22 @@ from __future__ import annotations
 
 import os
 import re
+import argparse
 from typing import Dict, Tuple
 
 import pandas as pd
 import networkx as nx
 import matplotlib.pyplot as plt
 from pyvis.network import Network
+
+THEME = {
+    "bg": "#121212",
+    "text": "#FFFFFF",
+    "seed_node": "#1ED760",    # official Spotify green
+    "hop1_node": "#3FA9E6",    # baby blue (not neon)
+    "node_border": "#121212",  # official Spotify black
+    "edge_rgb": (172, 173, 172), # light gray
+}
 
 
 def slugify(text: str) -> str:
@@ -85,8 +95,8 @@ def edge_style(weight: float) -> Dict[str, float]:
     Map edge weight (# shared tracks) to styling.
     """
     w = float(weight)
-    width = min(10.0, 0.5 + (w * 0.15))     # cap thickness
-    opacity = min(0.85, 0.15 + (w * 0.03))  # stronger edges more visible
+    width = min(20.0, 1.6 + (w * 0.4))
+    opacity = min(0.9, 0.2 + (w * 0.05))
     return {"width": width, "opacity": opacity}
 
 
@@ -136,7 +146,7 @@ def write_pyvis_html(G: nx.Graph, out_dir: str, filename: str = "network.html") 
     """
     Interactive HTML graph.
     """
-    net = Network(height="800px", width="100%", bgcolor="#111111", font_color="white")
+    net = Network(height="800px", width="100%", bgcolor=THEME["bg"], font_color=THEME["text"])
 
     # Physics makes it readable; users can drag nodes around.
     net.force_atlas_2based()
@@ -164,7 +174,7 @@ def write_pyvis_html(G: nx.Graph, out_dir: str, filename: str = "network.html") 
         size = popularity_to_node_size(popularity)
 
         # Simple coloring by hop for now (seed vs others)
-        color = "#ffcc00" if hop == 0 else "#66ccff"
+        color = THEME["seed_node"] if hop == 0 else THEME["hop1_node"]
 
         title = (
             f"{attrs.get('name', node_id)}<br>"
@@ -178,20 +188,27 @@ def write_pyvis_html(G: nx.Graph, out_dir: str, filename: str = "network.html") 
             label=attrs.get("name", node_id),
             title=title,
             size=size,
-            color=color,
+            color={
+                "background": color,
+                "border": THEME["node_border"],
+                "highlight": {"background": color, "border": THEME["text"]},
+                "hover": {"background": color, "border": THEME["text"]},
+            },
+            font={"color": THEME["text"], "size": 16, "face": "system-ui"},
         )
 
     for u, v, attrs in G.edges(data=True):
         weight = attrs.get("weight", 1)
         # Use weight to make edges thicker in the interactive view
         style = edge_style(weight)
+        r, g, b = THEME["edge_rgb"]
         net.add_edge(
             u,
             v,
             value=weight,
             title=f"Shared tracks: {weight}",
             width=style["width"],
-            color=f"rgba(120, 200, 255, {style['opacity']})",
+            color=f"rgba({r}, {g}, {b}, {style['opacity']})",
         )
 
     out_path = os.path.join(out_dir, filename)
@@ -216,7 +233,7 @@ def write_static_png(G: nx.Graph, out_dir: str, filename: str = "network.png") -
         popularity = attrs.get("popularity", 0) or 0
         hop = attrs.get("hop", 1)
         sizes.append(popularity_to_node_size(popularity) * 20)  # scale for matplotlib
-        colors.append("#ffcc00" if hop == 0 else "#66ccff")
+        colors.append(THEME["seed_node"] if hop == 0 else THEME["hop1_node"])
         labels[node_id] = attrs.get("name", node_id)
 
     # Edge widths based on weight (cap so it doesn't get ridiculous)
@@ -227,18 +244,26 @@ def write_static_png(G: nx.Graph, out_dir: str, filename: str = "network.png") -
 
     plt.figure(figsize=(18, 12), dpi=200)
     ax = plt.gca()
-    ax.set_facecolor("#111111")
-    plt.gcf().patch.set_facecolor("#111111")
+    ax.set_facecolor(THEME["bg"])
+    plt.gcf().patch.set_facecolor(THEME["bg"])
     
-    nx.draw_networkx_edges(G, pos, width=widths, alpha=0.35, edge_color="#66ccff")
-    nx.draw_networkx_nodes(G, pos, node_size=sizes, node_color=colors, alpha=0.9)
+    nx.draw_networkx_edges(G, pos, width=widths, alpha=0.28, edge_color=THEME["hop1_node"])
+    nx.draw_networkx_nodes(
+        G,
+        pos,
+        node_size=sizes,
+        node_color=colors,
+        alpha=0.92,
+        linewidths=1.0,
+        edgecolors=THEME["node_border"],
+    )
 
     # Labels: only label the seed + top-degree nodes to keep it readable
     degree_by_node = dict(G.degree())
     top_nodes = set(sorted(degree_by_node, key=degree_by_node.get, reverse=True)[:15])
 
     label_subset = {n: labels[n] for n in G.nodes() if (G.nodes[n].get("hop") == 0 or n in top_nodes)}
-    nx.draw_networkx_labels(G, pos, labels=label_subset, font_size=8, font_color="white")
+    nx.draw_networkx_labels(G, pos, labels=label_subset, font_size=8, font_color=THEME["text"])
 
     plt.axis("off")
     out_path = os.path.join(out_dir, filename)
@@ -248,14 +273,29 @@ def write_static_png(G: nx.Graph, out_dir: str, filename: str = "network.png") -
     return out_path
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Generate CollabGraph visualizations from saved CSV outputs.")
+    parser.add_argument(
+        "--seed",
+        type=str,
+        default=None,
+        help="Spotify seed artist ID. If provided, visualize outputs for that seed folder.",
+    )
+    return parser.parse_args()
+
+
 def main():
-    # Set seed here (keep consistent with hop2.py for now)
-    seed_artist_id = "2YZyLoL8N0Wb9xBt1NhZWg"
-    
-    out_dir = find_output_dir_by_seed_id(seed_artist_id)
+    args = parse_args()
+
+    # If provided, use the seed to locate the correct output folder automatically
+    if args.seed:
+        out_dir = find_output_dir_by_seed_id(args.seed)
+    else:
+        # Fallback: keep your existing default behavior (or pick the most recent folder later)
+        seed_artist_id = "2YZyLoL8N0Wb9xBt1NhZWg"
+        out_dir = find_output_dir_by_seed_id(seed_artist_id)
 
     nodes_df, edges_df = load_graph_data(out_dir)
-    
     G = build_networkx_graph(nodes_df, edges_df)
 
     html_path = write_pyvis_html(G, out_dir=out_dir, filename="network.html")
