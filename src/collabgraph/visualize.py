@@ -44,6 +44,15 @@ def slugify(text: str) -> str:
     return text.strip("_")
 
 
+def safe_matplotlib_label(text: str) -> str:
+    """
+    Matplotlib treats '$' as math-mode. Escape it so artist names render safely.
+    """
+    if text is None:
+        return ""
+    return str(text).replace("$", r"\$")
+
+
 def get_output_dir(seed_name: str, seed_artist_id: str) -> str:
     seed_slug = slugify(seed_name)
     short_id = seed_artist_id[:8]
@@ -234,7 +243,7 @@ def write_static_png(G: nx.Graph, out_dir: str, filename: str = "network.png") -
         hop = attrs.get("hop", 1)
         sizes.append(popularity_to_node_size(popularity) * 20)  # scale for matplotlib
         colors.append(THEME["seed_node"] if hop == 0 else THEME["hop1_node"])
-        labels[node_id] = attrs.get("name", node_id)
+        labels[node_id] = safe_matplotlib_label(attrs.get("name", node_id))
 
     # Edge widths based on weight (cap so it doesn't get ridiculous)
     widths = []
