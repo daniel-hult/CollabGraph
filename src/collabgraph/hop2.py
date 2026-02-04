@@ -31,22 +31,92 @@ from spotipy.oauth2 import SpotifyClientCredentials
 from spotipy.exceptions import SpotifyException
 
 
-# --- Throttle tuning (safe defaults) ---
+# ----------------------------
+# Rate limit hardening knobs
+# ----------------------------
+
+# Turn on/off all pacing
 THROTTLE_ENABLED = True
 
-# Base delay applied to most Spotify calls (seconds)
-THROTTLE_BASE_SECONDS = 0.08  # 80ms
+# Sustained request rate target (requests per second).
+TARGET_RPS = 2.0  # 120 requests/minute on average (but with jitter, not perfectly uniform)
 
-# Random jitter added/subtracted to avoid "robotic bursts"
-THROTTLE_JITTER_SECONDS = 0.04  # +/- 40ms
+# Random jitter to avoid perfectly periodic request patterns
+JITTER_SECONDS = 0.10  # up to +/-100ms
 
-# Extra cooldown applied after we encounter a 429 (added to base temporarily)
-THROTTLE_429_COOLDOWN_SECONDS = 0.30  # 300ms
+# Extra cooldown after a 429 to avoid immediate re-trigger
+COOLDOWN_AFTER_429_SECONDS = 1.0
+
+# If Spotify tells us to wait "forever" (hours), fail fast.
+# We do NOT keep retrying and risk making the ban worse.
+HUGE_RETRY_AFTER_SECONDS = 120
+
+# Safety budget: stop Hop 2 scan early to avoid catastrophic bans.
+# This does NOT reduce Hop 1; it only caps how deep Hop 2 scanning goes.
+ENABLE_CALL_BUDGET = True
+MAX_SPOTIFY_CALLS_PER_RUN = 8000  # adjust based on your needs
 
 # --- Simple run stats (helpful for you to understand runtime) ---
 SPOTIFY_CALL_COUNT = 0
 SPOTIFY_SLEEP_SECONDS = 0.0
 SPOTIFY_429_COUNT = 0
+
+
+class CallBudgetExceeded(Exception):
+    """Raised when we exceed the per-run Spotify API call budget."""
+
+class HardRateLimit(Exception):
+    """
+    Raised when we hit a 429 but cannot reliably extract a safe Retry-After.
+    In practice this often corresponds to the long lockouts (hours).
+    """
+
+class RateLimiter:
+    """
+    Very small sustained-rate limiter.
+
+    We enforce an average rate (TARGET_RPS) across the entire run.
+    This is more effective than micro-sleeps because it controls long-run request volume.
+    """
+
+    def __init__(self, target_rps: float, jitter_seconds: float = 0.0):
+        self.target_rps = max(0.1, float(target_rps))
+        self.min_interval = 1.0 / self.target_rps
+        self.jitter_seconds = max(0.0, float(jitter_seconds))
+        self._next_allowed = time.monotonic()
+
+    def wait(self, extra: float = 0.0) -> float:
+        """
+        Sleep until the next request is allowed.
+        Returns how long we slept (seconds).
+        """
+        if not THROTTLE_ENABLED:
+            return 0.0
+
+        now = time.monotonic()
+
+        # Jitter: small randomization around the schedule
+        jitter = random.uniform(-self.jitter_seconds, self.jitter_seconds)
+
+        scheduled = self._next_allowed + extra + jitter
+        sleep_for = max(0.0, scheduled - now)
+
+        if sleep_for > 0:
+            time.sleep(sleep_for)
+
+        # Move the schedule forward by one slot, anchored to "now" so we don't drift weirdly
+        now_after = time.monotonic()
+        self._next_allowed = max(self._next_allowed, now_after) + self.min_interval
+
+        return sleep_for
+    
+    def set_target_rps(self, target_rps: float) -> None:
+        self.target_rps = max(0.1, float(target_rps))
+        self.min_interval = 1.0 / self.target_rps
+
+
+# Global limiter instance used by spotify_call()
+RATE_LIMITER = RateLimiter(target_rps=TARGET_RPS, jitter_seconds=JITTER_SECONDS)
 
 # ----------------------------
 # Data shapes
@@ -103,6 +173,14 @@ def spotify_call(fn, *args, max_retries: int = 5, **kwargs):
     for attempt in range(1, max_retries + 1):
         # Count and throttle PER ACTUAL REQUEST ATTEMPT (important!)
         SPOTIFY_CALL_COUNT += 1
+
+        # Global safety budget: prevent runaway call volume anywhere in the code.
+        if ENABLE_CALL_BUDGET and SPOTIFY_CALL_COUNT >= MAX_SPOTIFY_CALLS_PER_RUN:
+            raise CallBudgetExceeded(
+                f"Spotify call budget exceeded ({SPOTIFY_CALL_COUNT} >= {MAX_SPOTIFY_CALLS_PER_RUN}). "
+                "Stopping Hop 2 scan early to avoid triggering long rate-limit bans."
+            )
+
         throttle_sleep()
 
         try:
@@ -113,32 +191,61 @@ def spotify_call(fn, *args, max_retries: int = 5, **kwargs):
                 SPOTIFY_429_COUNT += 1
 
                 retry_after = None
-                if hasattr(e, "headers") and e.headers:
-                    retry_after = e.headers.get("Retry-After")
+                retry_after_source = "unknown"
 
+                # 1) Best case: Retry-After header exists
+                if hasattr(e, "headers") and e.headers:
+                    header_val = e.headers.get("Retry-After")
+                    if header_val is not None:
+                        retry_after = header_val
+                        retry_after_source = "header"
+
+                # 2) Fallback: sometimes the wait time is embedded in the exception message
+                # NOTE: In some cases Spotipy prints the "Retry will occur after" line separately
+                # and the exception string won't contain it. That's why we treat "unknown" as dangerous.
+                if retry_after is None:
+                    msg = str(e)
+                    m = re.search(r"retry\s*will\s*occur\s*after:\s*([0-9]+)\s*s", msg, flags=re.IGNORECASE)
+                    if m:
+                        retry_after = m.group(1)
+                        retry_after_source = "message"
+
+                # Normalize
                 if retry_after is not None:
                     try:
                         retry_after = float(retry_after)
                     except ValueError:
                         retry_after = None
+                        retry_after_source = "unknown"
 
-                # If Spotify says something insane (hours), don't hang the script.
-                if retry_after and retry_after > 120:
-                    raise RuntimeError(
-                        f"Spotify rate limit hit with Retry-After={retry_after:.0f}s (very large). "
-                        "Stop the run and try again later, or reduce caps."
+                # If we can't read a sane Retry-After, treat it as a hard lockout and stop.
+                # This prevents your code from poking the API repeatedly during a ban window.
+                if retry_after is None:
+                    raise HardRateLimit(
+                        "Spotify 429 received but Retry-After could not be determined. "
+                        "Stopping immediately to avoid making a long ban worse."
                     )
 
-                sleep_for = retry_after if retry_after is not None else delay_seconds
-                sleep_for = min(sleep_for, 60)
+                # If Spotify tells us to wait "forever" (hours), abort immediately.
+                if retry_after > HUGE_RETRY_AFTER_SECONDS:
+                    raise HardRateLimit(
+                        f"Spotify rate limit hit. Retry-After={retry_after:.0f}s (too large). "
+                        "Stopping immediately to avoid making the ban worse. Try again later."
+                    )
 
-                print(f"[rate-limit] 429 from Spotify. Sleeping {sleep_for:.1f}s (attempt {attempt}/{max_retries})")
+                # Otherwise: short backoff + retry
+                sleep_for = min(retry_after, 60.0)
+
+                print(
+                    f"[rate-limit] 429 from Spotify. Sleeping {sleep_for:.1f}s "
+                    f"(attempt {attempt}/{max_retries}, source={retry_after_source})"
+                )
                 sleep_and_track(sleep_for)
 
-                delay_seconds = min(delay_seconds * 2, 30)
+                delay_seconds = min(delay_seconds * 2, 30.0)
 
-                # Small additional cooldown after 429 to avoid immediate re-triggering
-                throttle_sleep(extra=THROTTLE_429_COOLDOWN_SECONDS)
+                # Extra cooldown before next attempt
+                throttle_sleep(extra=COOLDOWN_AFTER_429_SECONDS)
                 continue
 
             # Optional: retry some 5xx errors (rare but happens)
@@ -149,6 +256,10 @@ def spotify_call(fn, *args, max_retries: int = 5, **kwargs):
                 continue
 
             raise
+
+    raise RuntimeError(
+        f"Spotify call failed after {max_retries} retries: {getattr(fn, '__name__', str(fn))}"
+    )
 
 
 # ----------------------------
@@ -165,18 +276,12 @@ def done(message: str) -> None:
 
 def throttle_sleep(extra: float = 0.0) -> None:
     """
-    Sleep a small amount to reduce burst rate and avoid triggering 429s.
+    Apply sustained-rate limiting + jitter. Tracks time slept in stats.
     """
     global SPOTIFY_SLEEP_SECONDS
 
-    if not THROTTLE_ENABLED:
-        return
-
-    jitter = random.uniform(-THROTTLE_JITTER_SECONDS, THROTTLE_JITTER_SECONDS)
-    delay = max(0.0, THROTTLE_BASE_SECONDS + jitter + extra)
-
-    time.sleep(delay)
-    SPOTIFY_SLEEP_SECONDS += delay
+    slept = RATE_LIMITER.wait(extra=extra)
+    SPOTIFY_SLEEP_SECONDS += slept
 
 
 def sleep_and_track(seconds: float) -> None:
@@ -397,6 +502,16 @@ def build_hop2_network(
 
     done(f"Selected {len(hop1_ids)} Hop 1 artists (cap={max_hop1})")
 
+    # Adaptive pacing: slow down automatically for large networks
+    if len(hop1_ids) >= 150:
+        RATE_LIMITER.set_target_rps(1.0)
+        print("🧯 Large network detected (>=150 hop1). Setting TARGET_RPS=1.0 for safety.")
+    elif len(hop1_ids) >= 100:
+        RATE_LIMITER.set_target_rps(1.2)
+        print("🧯 Medium-large network detected (>=100 hop1). Setting TARGET_RPS=1.2 for safety.")
+    else:
+        RATE_LIMITER.set_target_rps(TARGET_RPS)
+
     allowed_ids: Set[str] = set([seed_artist_id] + hop1_ids)
 
     status("Fetching Hop 1 artist metadata (name/popularity/followers)…")
@@ -470,36 +585,60 @@ def build_hop2_network(
 
     # 2) Hop 2: scan tracks for each hop1 artist, add edges among allowed ids on those tracks
     total_hop1 = len(hop1_ids)
+    hop2_scan_completed = True  # we'll flip this if we stop early
+    hop2_stop_reason: Optional[str] = None
+
     for idx, hop1_id in enumerate(hop1_ids, start=1):
         if idx == 1 or idx % 10 == 0 or idx == total_hop1:
             print(f"⏳ Hop 2 scan: {idx}/{total_hop1} hop1 artists…")
 
-        hop1_track_ids = get_artist_track_ids(
-            sp,
-            artist_id=hop1_id,
-            max_albums=max_albums_per_hop1_artist,
-            max_tracks=max_tracks_per_hop1_artist,
-            include_appears_on=False,
-        )
+        try:
+            # (Optional) Fast pre-check to stop before a new expensive chunk begins
+            if ENABLE_CALL_BUDGET and SPOTIFY_CALL_COUNT > MAX_SPOTIFY_CALLS_PER_RUN:
+                raise CallBudgetExceeded(
+                    f"Budget reached at {SPOTIFY_CALL_COUNT} calls (cap={MAX_SPOTIFY_CALLS_PER_RUN})."
+                )
 
-        hop1_tracks = get_tracks_details_bulk(sp, hop1_track_ids)
+            hop1_track_ids = get_artist_track_ids(
+                sp,
+                artist_id=hop1_id,
+                max_albums=max_albums_per_hop1_artist,
+                max_tracks=max_tracks_per_hop1_artist,
+                include_appears_on=False,
+            )
 
-        for tr in hop1_tracks:
-            if not tr or not tr.get("id"):
-                continue
+            hop1_tracks = get_tracks_details_bulk(sp, hop1_track_ids)
 
-            artists = tr.get("artists", [])
-            present = [a.get("id") for a in artists if a.get("id") and a.get("id") in allowed_ids]
+            for tr in hop1_tracks:
+                if not tr or not tr.get("id"):
+                    continue
 
-            # Create edges for every pair among present artists
-            # (Typically 2–4 artists per track, so this is cheap.)
-            unique_present = list(dict.fromkeys(present))
-            for i in range(len(unique_present)):
-                for j in range(i + 1, len(unique_present)):
-                    u = unique_present[i]
-                    v = unique_present[j]
-                    if u != v:
-                        add_edge_track(u, v, tr)
+                artists = tr.get("artists", [])
+                present = [
+                    a.get("id")
+                    for a in artists
+                    if a.get("id") and a.get("id") in allowed_ids
+                ]
+
+                unique_present = list(dict.fromkeys(present))
+                for i in range(len(unique_present)):
+                    for j in range(i + 1, len(unique_present)):
+                        u = unique_present[i]
+                        v = unique_present[j]
+                        if u != v:
+                            add_edge_track(u, v, tr)
+
+        except (CallBudgetExceeded, HardRateLimit) as e:
+            hop2_scan_completed = False
+            hop2_stop_reason = e.__class__.__name__
+            print(f"⚠️ {e}")
+            print("⚠️ Stopping Hop 2 scan early and writing partial results.")
+            break
+    
+    if hop2_scan_completed:
+        done("Hop 2 scan completed for all hop1 artists")
+    else:
+        print(f"ℹ️ Hop 2 scan ended early ({hop2_stop_reason}). Partial Hop 2.")
 
     # Build edges_df from edge_to_track_ids (weight = # unique shared tracks)
     edges_rows = []
