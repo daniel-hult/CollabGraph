@@ -128,6 +128,7 @@ class ArtistInfo:
     name: str
     popularity: Optional[int]
     followers: Optional[int]
+    genres: str  # comma-separated string for CSV friendliness
     hop: int  # 0 for seed, 1 for hop1
 
 
