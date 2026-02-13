@@ -528,6 +528,7 @@ def build_hop2_network(
             name=seed["name"],
             popularity=seed.get("popularity"),
             followers=(seed.get("followers") or {}).get("total"),
+            genres=", ".join(seed.get("genres") or []),
             hop=0,
         )
     ]
@@ -538,6 +539,7 @@ def build_hop2_network(
                 name=a["name"],
                 popularity=a.get("popularity"),
                 followers=(a.get("followers") or {}).get("total"),
+                genres=", ".join(a.get("genres") or []),
                 hop=1,
             )
         )

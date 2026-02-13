@@ -25,6 +25,73 @@ import pandas as pd
 
 
 # ----------------------------
+# Helper Functions
+# ----------------------------
+
+def spotify_artist_url(artist_id: str) -> str:
+    return f"https://open.spotify.com/artist/{artist_id}"
+
+
+def percentile_rank(series: pd.Series) -> pd.Series:
+    """
+    Rank-based percentile in (0, 1], handles ties nicely.
+    """
+    return series.rank(pct=True, method="average")
+
+
+def bucket_5(p: float) -> str:
+    """
+    Map percentile to 5 buckets.
+    """
+    if pd.isna(p):
+        return "Unknown"
+    if p <= 0.20:
+        return "Very Low"
+    if p <= 0.40:
+        return "Low"
+    if p <= 0.60:
+        return "Medium"
+    if p <= 0.80:
+        return "High"
+    return "Very High"
+
+
+def level_3(bucket: str) -> str:
+    """
+    Collapse 5 buckets to low/mid/high for interpretation mapping.
+    """
+    if bucket in ("Very Low", "Low"):
+        return "low"
+    if bucket == "Medium":
+        return "mid"
+    if bucket in ("High", "Very High"):
+        return "high"
+    return "unknown"
+
+
+def interpret_role(bridge_bucket: str, influence_bucket: str) -> str:
+    b = level_3(bridge_bucket)
+    i = level_3(influence_bucket)
+
+    if b == "unknown" or i == "unknown":
+        return "Network role unavailable for this node (metric could not be computed reliably)."
+
+    mapping = {
+        ("low", "low"):  "Peripheral in this network — few collaborations connect through them.",
+        ("low", "mid"):  "Mostly local connections — not a major bridge or influence hub.",
+        ("low", "high"): "Influential within a tight circle — important locally, not a connector.",
+
+        ("mid", "low"):  "Occasional connector — bridges a few collaborators but not central.",
+        ("mid", "mid"):  "Balanced role — contributes to connectivity without dominating it.",
+        ("mid", "high"): "Growing influence — well-connected and increasingly central to the network.",
+
+        ("high", "low"):  "Key bridge — links groups that otherwise wouldn’t connect.",
+        ("high", "mid"):  "Strong connector — important for flow between clusters.",
+        ("high", "high"): "Core hub — both highly influential and a major connector.",
+    }
+    return mapping[(b, i)]
+
+# ----------------------------
 # Graph construction
 # ----------------------------
 
@@ -174,6 +241,58 @@ def main():
     metrics_path = os.path.join(data_dir, "node_metrics.csv")
     nodes_df.to_csv(metrics_path, index=False)
 
+    # ----------------------------
+    # Tooltip-ready enrichment
+    # ----------------------------
+
+    # Ensure these exist even if older nodes.csv doesn't have them yet
+    if "genres" not in nodes_df.columns:
+        nodes_df["genres"] = ""
+
+    # Spotify artist profile URL
+    nodes_df["spotify_url"] = nodes_df["artist_id"].astype(str).apply(spotify_artist_url)
+
+    # Percentiles (rank-based). Higher = more "bridge" or more "influence"
+    nodes_df["betweenness_pct"] = percentile_rank(nodes_df["betweenness"].fillna(0.0))
+    nodes_df["eigenvector_pct"] = percentile_rank(nodes_df["eigenvector"].fillna(0.0))
+
+    # Categorical buckets (Very Low -> Very High)
+    nodes_df["bridge_category"] = nodes_df["betweenness_pct"].apply(bucket_5)
+    nodes_df["influence_category"] = nodes_df["eigenvector_pct"].apply(bucket_5)
+
+    # One-sentence interpretation from (bridge_category, influence_category)
+    nodes_df["interpretation"] = [
+        interpret_role(b, i)
+        for b, i in zip(nodes_df["bridge_category"], nodes_df["influence_category"])
+    ]
+
+    # Clean up genres formatting (optional)
+    nodes_df["genres"] = nodes_df["genres"].fillna("").astype(str)
+
+    # Keep the tooltip output file lean + predictable
+    tooltip_cols = [
+        "artist_id",
+        "name",
+        "spotify_url",
+        "genres",
+        "hop",
+        "popularity",
+        "followers",
+        "degree",
+        "weighted_degree",
+        "betweenness",
+        "betweenness_pct",
+        "bridge_category",
+        "eigenvector",
+        "eigenvector_pct",
+        "influence_category",
+        "interpretation",
+    ]
+    tooltip_df = nodes_df[[c for c in tooltip_cols if c in nodes_df.columns]].copy()
+
+    tooltip_path = os.path.join(data_dir, "node_tooltips.csv")
+    tooltip_df.to_csv(tooltip_path, index=False)
+
     print("⏳ Computing network summary…")
     summary = compute_summary_stats(G)
 
@@ -184,6 +303,7 @@ def main():
     print("✅ Analysis complete")
     print(f"- {metrics_path}")
     print(f"- {summary_path}")
+    print(f"- {tooltip_path}")
 
 
 if __name__ == "__main__":
