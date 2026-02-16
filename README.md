@@ -42,7 +42,7 @@ The result is a clean, dynamic network where:
 
 Each artist in the network includes:
 
--   🎵 **Popularity (0--100)**
+-   🎵 **Popularity (0-100)**
 -   👥 **Follower count**
 -   🌉 **Bridge Score** (Betweenness Centrality)
 -   ⭐ **Influence Score** (Eigenvector Centrality)
